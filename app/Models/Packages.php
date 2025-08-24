@@ -10,6 +10,7 @@ class Packages extends Model
 {
     use HasFactory;
 
+
     protected $fillable = [
         'name',
         'duration',
@@ -20,6 +21,9 @@ class Packages extends Model
         'tag',
         'status',
     ];
+
+    public $timestamps = true; // uses created_at & updated_at
+
 
     protected $casts = [
         'created_at' => "datetime:Y-m-d\ h:i:s",

@@ -3,9 +3,8 @@
 namespace App\Http\Controllers\Api\V1\Auth;
 
 use Validator;
+use Carbon\Carbon;
 use App\Models\User;
-use App\Models\Packages;
-use App\Models\Category;
 use App\Models\Operator;
 use Illuminate\Http\Request;
 use App\Traits\ActivityTrait;
@@ -20,7 +19,7 @@ class ApiAuthController extends Controller
 
     public function  __construct()
     {
-        $this->middleware('auth:api', ['except' => ['registration', 'login_for_user', 'LoginWithThirdPartyApi', 'getPacakgeList']]);
+        $this->middleware('auth:api', ['except' => ['registration', 'login_for_user', 'LoginWithThirdPartyApi', 'UserProfileUpdate', 'userInfo']]);
     }
 
     protected function guard()
@@ -148,11 +147,15 @@ class ApiAuthController extends Controller
             return $this->ResponseJson(true, "Input data error", $validator->errors(), 200);
         } else {
 
+            $operator = Operator::where('name', 'like', $request->operator)->first();
             $dt = User::findOrFail($request->user_id);
 
             $dt->name = isset($request->name) ? $request->name : $dt->name;
             $dt->mobile = isset($request->mobile) ? $request->mobile : $dt->mobile;
-            $dt->operator = isset($request->operator) ? $request->operator : "";
+            if (isset($request->operator) && !empty($request->operator)) {
+                $operator = Operator::where('name', 'like', '%' . $request->operator . '%')->first();
+                $dt->operator = $operator ? $operator->id : null;
+            }
 
             // if ($request->file('profile_photo_path')) {
             //     $file = $request->file('profile_photo_path');
@@ -164,56 +167,134 @@ class ApiAuthController extends Controller
             // }
             $dt->save();
             $this->activity_log('Profile', 'Profile Update', 'Profile Data Updated', 'Done', $dt->id);
-            return $this->ResponseJson(false, 'Profile Updated Successfully', "", 200);
+            return $this->ResponseJson(false, 'Profile Updated Successfully', $dt, 200);
         }
     }
 
 
+
     public function login_for_user(Request $request)
     {
-
         $validator = Validator::make($request->all(), [
             'username' => 'required',
             'password' => 'required',
         ]);
 
         if ($validator->fails()) {
-
-            $this->activity_log('Registration', 'ThirdParty Registration', implode(",", $validator->messages()->all()), 'Faild', $request->mobile);
+            $this->activity_log('Registration', 'ThirdParty Registration', implode(",", $validator->messages()->all()), 'Failed', $request->username ?? '');
             return $this->sendError(true, 'Validation Error.', $validator->messages()->all(), 406);
-        } else {
-
-            $token = $this->guard()->attempt(['username' => $request->username, 'password' => $request->password]);
-
-            if ($token) {
-                $user =  auth('api')->user();
-                //$update_user = User::UpdateLoginDate($user->id);
-                $data["id"] = $user->id;
-                $data["name"] = $user->name;
-                $data["email"] = $user->email != "" ? $user->email : '';
-                $data["username"] = $user->username != "" ? $user->username : '';
-                $data["mobile"] = $user->mobile != "" ? $user->mobile : '';
-                $data["usertype"] = $user->usertype != "" ? $user->usertype : 'User';
-                $data["operator"] = $user->operator != "" ? $user->operator : '';
-                $data["registered_by"] = $user->registered_by;
-                $authenticate_token = $this->respondWithToken($token);
-                $data["jwt_token"] = $authenticate_token->getData(true);
-
-                $this->activity_log('Login', 'Deafult Login', 'Login Successfully', 'Done', $user->id);
-                return $this->ResponseJson(false, 'Login Successfull!', $data, 200);
-            } else {
-                $this->activity_log('Login', 'Deafult Login', 'Login Credentials Not Matched', 'Faild', $request->username);
-                return $this->ResponseJson(true, "Invalid Credentials.", (object)[], 401);
-            }
         }
+
+        // Optional early check: if the user exists but inactive, short-circuit
+        $candidate = User::where('username', $request->username)->first();
+        if ($candidate && !$this->isUserActive($candidate)) {
+            $this->activity_log('Login', 'Default Login', 'User account not active', 'Failed', $request->username);
+            return $this->ResponseJson(true, 'User account is not active. Please contact admin.', (object)[], 403);
+        }
+
+        // Attempt JWT auth
+        $token = $this->guard()->attempt([
+            'username' => $request->username,
+            'password' => $request->password
+        ]);
+
+        if (!$token) {
+            $this->activity_log('Login', 'Default Login', 'Login credentials not matched', 'Failed', $request->username);
+            return $this->ResponseJson(true, "Invalid Credentials.", (object)[], 401);
+        }
+
+        // Safety check after auth too (in case status changed mid-way)
+        /** @var User $user */
+        $user = auth('api')->user();
+        if (!$this->isUserActive($user)) {
+            // Invalidate the just-issued token and deny access
+            try {
+                $this->guard()->logout(true);
+            } catch (\Throwable $e) {
+            }
+            $this->activity_log('Login', 'Default Login', 'User account not active', 'Failed', $user->id);
+            return $this->ResponseJson(true, 'User account is not active. Please contact admin.', (object)[], 403);
+        }
+
+        // Build response data
+        $data = [
+            "id"            => $user->id,
+            "name"          => $user->name ?? '',
+            "email"         => $user->email ?? '',
+            "username"      => $user->username ?? '',
+            "mobile"        => $user->mobile ?? '',
+            "usertype"      => $user->usertype ?: 'User',
+            "operator"      => $user->operator ? optional(Operator::find($user->operator))->name : '',
+            "registered_by" => $user->registered_by ?? '',
+        ];
+
+        $authenticate_token = $this->respondWithToken($token);
+        $data["jwt_token"] = $authenticate_token->getData(true);
+
+        $this->activity_log('Login', 'Default Login', 'Login Successfully', 'Done', $user->id);
+        return $this->ResponseJson(false, 'Login Successful!', $data, 200);
     }
 
-
-    public function userInfo()
+    /**
+     * Treat user as active only if matches your convention.
+     * Adjust to your schema: e.g., is_active === 'Active' or is_active == 1.
+     */
+    private function isUserActive(User $user): bool
     {
-        $data = $this->guard()->user();
-        return $this->ResponseJson(false, 'User Profile Data', $data, 200);
+        // Common patterns:
+        // return (string)$user->is_active === 'Active';
+        // return (int)$user->is_active === 1;
+        // Support both (string flag or tinyint) to be safe:
+        return ($user->is_active === 'Active') || ($user->is_active === 1) || ($user->is_active === '1');
     }
+
+    public function userDelete($id = null)
+    {
+        $user = User::findOrFail($id);
+
+        $user->update([
+            'is_active' => 'Deactive'
+        ]);
+
+        return $this->ResponseJson(false, 'User Deleted Successfully', $user, 200);
+    }
+    public function userInfo($id = null)
+    {
+        // 1) Get user (by id or current auth user)
+        if ($id) {
+            $data = User::findOrFail($id);
+        } else {
+            $data = $this->guard()->user();
+        }
+
+        if (!$data) {
+            return $this->sendError(true, 'User not found.', [], 404);
+        }
+
+        // 2) Convert to array
+        $user = $data->toArray();
+
+        // 3) Format dates
+        if (!empty($data->created_at)) {
+            $user['created_at'] = Carbon::parse($data->created_at)->format('d M Y, h:i A');
+        }
+        if (!empty($data->updated_at)) {
+            $user['updated_at'] = Carbon::parse($data->updated_at)->format('d M Y, h:i A');
+        }
+        if (!empty($data->email_verified_at)) {
+            $user['email_verified_at'] = Carbon::parse($data->email_verified_at)->format('d M Y, h:i A');
+        }
+
+        // 4) Replace null values with ""
+        array_walk_recursive($user, function (&$v) {
+            if (is_null($v)) {
+                $v = "";
+            }
+        });
+
+        return $this->ResponseJson(false, 'User Profile Data', $user, 200);
+    }
+
 
     public function logout()
     {
@@ -243,31 +324,5 @@ class ApiAuthController extends Controller
             'token_type' => 'bearer',
             'expires_in' => $this->guard()->factory()->getTTL() * 60
         ]);
-    }
-
-    public function getPacakgeList(Request $request)
-    {
-        $packageQuery = Packages::query()
-            ->with(['operator', 'category'])
-            ->where('packages.status', 1)
-            ->when($request->filled('operator'), function ($q) use ($request) {
-                $ops = is_array($request->operator)
-                    ? $request->operator
-                    : array_map('trim', explode(',', $request->operator));
-
-                $q->whereHas('operator', fn ($oq) => $oq->whereIn('name', $ops));
-            })
-            ->when($request->filled('category'), function ($q) use ($request) {
-                $cats = is_array($request->category)
-                    ? $request->category
-                    : array_map('trim', explode(',', $request->category));
-
-                $q->whereHas('category', fn ($cq) => $cq->whereIn('name', $cats));
-            })
-            ->orderByDesc('packages.created_at');
-
-        $getlist = $packageQuery->get();
-
-        return $this->ResponseJson(false, 'Package List', $getlist, 200);
     }
 }
